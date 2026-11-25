@@ -1,2 +1,2 @@
 # DormIO
-DormIO is a centralized student focus dorm hunting app that its main focus is to provide dorm availability.
+DormIO is a centralized student focus dorm hunting app that its main focus is to provide dorm availability. Each condo or any apartment near to the area you want to stay in. Students struggle to find a nearby dorm that will accommodate them that fits their budget, location preference, and needs. Once you are settled with the dorm of your choice you will detect all the need expenses and other management that the dorm needed we also add a feature where you can messageyour roommate/dormmate
