@@ -1,0 +1,190 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ================= helpers =================
+    function signedIn() { return request.auth != null; }
+    function isUser(uid) { return signedIn() && request.auth.uid == uid; }
+    function isText(v, min, max) { return v is string && v.size() >= min && v.size() <= max; }
+    function incoming() { return request.resource.data; }
+    function onlyChanges(fields) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(fields);
+    }
+    function dormData(dormId) {
+      return get(/databases/$(database)/documents/dormitories/$(dormId)).data;
+    }
+    function isHostOf(dormId) { return signedIn() && dormData(dormId).ownerId == request.auth.uid; }
+    function isResidentOf(dormId) { return signedIn() && request.auth.uid in dormData(dormId).residentIds; }
+    function isMemberOf(dormId) { return isHostOf(dormId) || isResidentOf(dormId); }
+    function roleOf(uid) { return get(/databases/$(database)/documents/users/$(uid)).data.role; }
+
+    // ================= users =================
+    function validUserCore(d) {
+      return isText(d.fullName, 2, 60)
+        && isText(d.email, 5, 120) && d.email.matches('.+@.+\\..+')
+        && isText(d.phone, 7, 20) && d.phone.matches('^\\+?[0-9]{7,15}$');
+    }
+
+    match /users/{uid} {
+      allow read: if signedIn();
+      allow create: if isUser(uid)
+        && incoming().keys().hasOnly(['fullName','email','phone','role','isVerified','photoUrl','createdAt','updatedAt'])
+        && incoming().keys().hasAll(['fullName','email','phone','role','isVerified','createdAt','updatedAt'])
+        && validUserCore(incoming())
+        && incoming().role in ['seeker', 'host']
+        && incoming().isVerified == false
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      // role, email, isVerified and createdAt can never be edited by the user
+      allow update: if isUser(uid)
+        && onlyChanges(['fullName','phone','photoUrl','updatedAt'])
+        && validUserCore(incoming())
+        && incoming().updatedAt == request.time;
+      allow delete: if false;
+    }
+
+    // ================= dormitories =================
+    function validDorm(d) {
+      return d.keys().hasOnly(['ownerId','name','description','address','city','roomType','pricePerMonth','capacity','availableSlots','amenities','photos','houseRules','isActive','residentIds','createdAt','updatedAt','latitude','longitude','propertyType'])
+        && d.keys().hasAll(['ownerId','name','description','address','city','roomType','pricePerMonth','capacity','availableSlots','amenities','photos','houseRules','isActive','residentIds','createdAt','updatedAt'])
+        && isText(d.name, 3, 80)
+        && isText(d.description, 0, 1000)
+        && isText(d.address, 3, 200)
+        && isText(d.city, 2, 60)
+        && d.roomType in ['single', 'twin', 'shared', 'studio']
+        && (!('propertyType' in d) || d.propertyType in ['dorm', 'condo', 'apartment'])
+        && d.pricePerMonth is number && d.pricePerMonth > 0 && d.pricePerMonth <= 1000000
+        && d.capacity is int && d.capacity >= 1 && d.capacity <= 50
+        && d.availableSlots is int && d.availableSlots >= 0 && d.availableSlots <= d.capacity
+        && d.amenities is list && d.amenities.size() <= 30
+        && d.photos is list && d.photos.size() <= 20
+        && (!('latitude' in d) || (d.latitude is number && d.latitude >= -90 && d.latitude <= 90))
+        && (!('longitude' in d) || (d.longitude is number && d.longitude >= -180 && d.longitude <= 180))
+        && isText(d.houseRules, 0, 2000)
+        && d.isActive is bool
+        && d.residentIds is list && d.residentIds.size() <= d.capacity;
+    }
+
+    match /dormitories/{dormId} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && incoming().ownerId == request.auth.uid
+        && roleOf(request.auth.uid) == 'host'
+        && validDorm(incoming())
+        && incoming().residentIds.size() == 0
+        && incoming().createdAt == request.time;
+      allow update: if isUser(resource.data.ownerId)
+        && incoming().ownerId == resource.data.ownerId
+        && incoming().createdAt == resource.data.createdAt
+        && validDorm(incoming());
+      allow delete: if isUser(resource.data.ownerId);
+    }
+
+    // ================= reservations =================
+    function validReservationCreate(d) {
+      return d.keys().hasOnly(['dormId','tenantId','ownerId','status','moveInDate','durationMonths','note','createdAt','updatedAt'])
+        && d.keys().hasAll(['dormId','tenantId','ownerId','status','moveInDate','durationMonths','note','createdAt','updatedAt'])
+        && d.status == 'pending'
+        && d.moveInDate is timestamp
+        && d.moveInDate >= request.time - duration.value(1, 'd')
+        && d.durationMonths is int && d.durationMonths >= 1 && d.durationMonths <= 24
+        && isText(d.note, 0, 300)
+        && d.createdAt == request.time
+        && d.updatedAt == request.time;
+    }
+    function dormAcceptsReservations(dormId, ownerId, tenantId) {
+      let d = dormData(dormId);
+      return d.isActive == true && d.availableSlots > 0 && d.ownerId == ownerId && ownerId != tenantId;
+    }
+    function validHostTransition(from, to) {
+      return (from == 'pending' && to in ['approved', 'rejected'])
+        || (from == 'approved' && to in ['cancelled', 'completed']);
+    }
+
+    match /reservations/{reservationId} {
+      allow read: if signedIn()
+        && (resource.data.tenantId == request.auth.uid || resource.data.ownerId == request.auth.uid);
+      allow create: if isUser(incoming().tenantId)
+        && validReservationCreate(incoming())
+        && dormAcceptsReservations(incoming().dormId, incoming().ownerId, incoming().tenantId);
+      allow update: if signedIn() && onlyChanges(['status', 'updatedAt']) && incoming().updatedAt == request.time && (
+        // tenant: may only cancel while still pending
+        (resource.data.tenantId == request.auth.uid
+          && resource.data.status == 'pending'
+          && incoming().status == 'cancelled')
+        ||
+        // host: approve / reject / cancel / complete
+        (resource.data.ownerId == request.auth.uid
+          && validHostTransition(resource.data.status, incoming().status))
+      );
+      allow delete: if false;
+    }
+
+    // ================= expenses =================
+    match /expenses/{expenseId} {
+      allow read: if isResidentOf(resource.data.dormId) || isHostOf(resource.data.dormId);
+      allow create: if isResidentOf(incoming().dormId)
+        && incoming().keys().hasOnly(['dormId','paidBy','title','amount','splitAmong','shares','settledBy','createdAt'])
+        && incoming().keys().hasAll(['dormId','paidBy','title','amount','splitAmong','shares','settledBy','createdAt'])
+        && incoming().paidBy == request.auth.uid
+        && isText(incoming().title, 1, 80)
+        && incoming().amount is number && incoming().amount > 0 && incoming().amount <= 1000000
+        && incoming().splitAmong is list && incoming().splitAmong.size() >= 1 && incoming().splitAmong.size() <= 20
+        && incoming().shares is map
+        && incoming().settledBy is list
+        && incoming().createdAt == request.time;
+      // a member may only add THEIR OWN uid to settledBy ("I paid my share")
+      allow update: if isResidentOf(resource.data.dormId)
+        && onlyChanges(['settledBy'])
+        && incoming().settledBy.toSet().difference(resource.data.settledBy.toSet()).hasOnly([request.auth.uid]);
+      allow delete: if isUser(resource.data.paidBy);
+    }
+
+    // ================= chores =================
+    match /chores/{choreId} {
+      allow read: if isMemberOf(resource.data.dormId);
+      allow create: if isMemberOf(incoming().dormId)
+        && incoming().keys().hasOnly(['dormId','title','assignedTo','createdBy','status','dueDate','completedAt','createdAt','updatedAt'])
+        && incoming().keys().hasAll(['dormId','title','assignedTo','createdBy','status','dueDate','completedAt','createdAt','updatedAt'])
+        && incoming().createdBy == request.auth.uid
+        && isText(incoming().title, 1, 80)
+        && isText(incoming().assignedTo, 1, 128)
+        && incoming().status == 'pending'
+        && incoming().dueDate is timestamp
+        && incoming().createdAt == request.time;
+      allow update: if isMemberOf(resource.data.dormId)
+        && onlyChanges(['status','assignedTo','completedAt','updatedAt'])
+        && incoming().status in ['pending', 'done']
+        && isText(incoming().assignedTo, 1, 128);
+      allow delete: if isUser(resource.data.createdBy) || isHostOf(resource.data.dormId);
+    }
+
+    // ================= messaging =================
+    match /conversations/{conversationId} {
+      allow read: if signedIn() && (resource == null || request.auth.uid in resource.data.participantIds);
+      allow create: if signedIn()
+        && incoming().keys().hasOnly(['participantIds','dormId','lastMessage','lastMessageAt','createdAt'])
+        && incoming().participantIds is list
+        && incoming().participantIds.size() == 2
+        && request.auth.uid in incoming().participantIds
+        && incoming().participantIds[0] != incoming().participantIds[1];
+      allow update: if signedIn()
+        && request.auth.uid in resource.data.participantIds
+        && onlyChanges(['lastMessage', 'lastMessageAt']);
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        function participants() {
+          return get(/databases/$(database)/documents/conversations/$(conversationId)).data.participantIds;
+        }
+        allow read: if signedIn() && request.auth.uid in participants();
+        allow create: if signedIn() && request.auth.uid in participants()
+          && incoming().keys().hasOnly(['senderId','text','createdAt'])
+          && incoming().senderId == request.auth.uid
+          && isText(incoming().text, 1, 1000)
+          && incoming().createdAt == request.time;
+        allow update, delete: if false; // messages are immutable
+      }
+    }
+  }
+}

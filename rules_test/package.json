@@ -1,0 +1,7 @@
+{
+  "name": "dormio-rules-test",
+  "private": true,
+  "scripts": {
+    "test": "node --test"
+  }
+}
